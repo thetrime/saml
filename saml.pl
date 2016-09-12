@@ -76,7 +76,7 @@ http:authenticate(saml(ServiceProvider), Request, [user_id(UserId)]):-
                                  memory_file_to_atom(MemFile, SAMLRequestRaw)
                                ),
                                free_memory_file(MemFile)),
-            ??base64(SAMLRequestRaw, SAMLRequest),
+            base64(SAMLRequestRaw, SAMLRequest),
             %SAMLRequest = 'fJHdasMwDIVfJfg+P06XpjVJILQMCtsY69jF7lxHXQ2J3Vny0r39TNPBOthAV9L5dDhSdTKY81y0ng7mCd49IEWnoTcopknNvDPCStQojBwABSmxbe/vRJ5k4ugsWWV79pPh/zMSERxpa1i0WddMFrPZQmY3Ki4LlcWcwzxeFiWP853qYF/yXbHgLHoBh4GpWVgRQEQPG4MkDYVWxudxtoyzxXOIMgtVvrKo/fZZWYN+ALcF96FVwDo41SxsaYmc3nmCSaHN229JU02JxNnQNQeio0jTcRwTBOWdJpAIibJDlV4rq8thH0L+zfrR9lp9Rm3f23HlQBLUjJwHFt1aN0j6+2I84eeO7uL9WSq8wSMovdfQsbS5+F5/sPkCAAD//wMA',
 	    format(user_error, 'Encoded request: ~w~n', [SAMLRequest]),
 	    % Form the URL
@@ -121,11 +121,36 @@ saml_acs_handler(ServiceProvider, Options, Request):-
         http_redirect(moved_temporary, Relay, Request).
 
 
-process_response(XML, ServiceProvider, Options):-
+propagate_ns([], _, []):- !.
+propagate_ns([element(Tag, Attributes, Children)|Siblings],
+             NS,
+             [element(Tag, NewAttributes, NewChildren)|NewSiblings]):-
+        !,
+        merge_ns(NS, Attributes, NewAttributes, NewNS),
+        propagate_ns(Children, NewNS, NewChildren),
+        propagate_ns(Siblings, NS, NewSiblings).
+propagate_ns([X|Siblings], NS, [X|NewSiblings]):-
+        propagate_ns(Siblings, NS, NewSiblings).
+
+merge_ns([xmlns:Prefix=Value|NS], Attributes, NewAttributes, NewNS):-
+        (  select(xmlns:Prefix=NewValue, Attributes, A1)
+        -> NewNS = [xmlns:Prefix=NewValue|T],
+           NewAttributes = [xmlns:Prefix=NewValue|N]
+        ;  A1 = Attributes,
+           NewNS = [xmlns:Prefix=Value|T],
+           NewAttributes = [xmlns:Prefix=Value|N]
+        ),
+        merge_ns(NS, A1, N, T).
+
+merge_ns([], A, A, NS):-
+        findall(xmlns:Prefix=Value, member(xmlns:Prefix=Value, A), NS).
+
+process_response(XML0, ServiceProvider, Options):-
         SAMLP = 'urn:oasis:names:tc:SAML:2.0:protocol',
         SAML = 'urn:oasis:names:tc:SAML:2.0:assertion',
         DS = 'http://www.w3.org/2000/09/xmldsig#',
-        XML = [element(ns(_, SAMLP):'Response', ResponseAttributes, Response)],
+        propagate_ns(XML0, [], XML),
+        XML = [element(ns(_, SAMLP):'Response', _, Response)],
         % Response MAY  contain the following elements  : Issuer, Signature, Extensions
         % Response MAY  contain the following attributes: InResponseTo, Destination, Consent
         % Response MUST contain the following elements  : Status
@@ -169,24 +194,18 @@ process_response(XML, ServiceProvider, Options):-
         ; throw(saml_rejected(illegal_response))
         ),
 
-        findall(xmlns:Prefix=URI, member(xmlns:Prefix=URI, ResponseAttributes), NSMap),
-
         % Response MAY also contain 0..N of the following elements: Assertion, EncryptedAssertion.
         forall(member(element(ns(SAMLPrefix, SAML):'Assertion', AssertionAttributes, Assertion), Response),
-               process_assertion(ServiceProvider, XML, AssertionAttributes, Assertion, SAMLPrefix=SAML, NSMap)),
+               process_assertion(ServiceProvider, XML, AssertionAttributes, Assertion)),
         forall(member(element(ns(SAMLPrefix, SAML):'EncryptedAssertion', _, EncryptedAssertion), Response),
                ( decrypt_xml(EncryptedAssertion, DecryptedAssertion, saml:saml_key_callback(ServiceProvider), Options),
 		 forall(member(element(SAML:'Assertion', AssertionAttributes, Assertion), DecryptedAssertion),
-                        process_assertion(ServiceProvider, XML, AssertionAttributes, Assertion, SAMLPrefix=SAML, NSMap))
+                        process_assertion(ServiceProvider, XML, AssertionAttributes, Assertion))
                )
 	      ).
 
 
-process_assertion(ServiceProvider, Document, Attributes, Assertion, AssertionPrefix=AssertionURI, NSMap):-
-        (  AssertionPrefix == ''
-        -> Options = [nsmap(NSMap)]
-        ;  Options = [nsmap([AssertionPrefix=AssertionURI|NSMap])]
-        ),
+process_assertion(ServiceProvider, Document, Attributes, Assertion):-
         SAML = ns(_, 'urn:oasis:names:tc:SAML:2.0:assertion'),
 	DS = ns(_, 'http://www.w3.org/2000/09/xmldsig#'),
         ( memberchk('ID'=_AssertionID, Attributes)->
@@ -202,7 +221,7 @@ process_assertion(ServiceProvider, Document, Attributes, Assertion, AssertionPre
         memberchk(element(SAML:'Issuer', _, [IssuerName]), Assertion),
         debug(saml, 'Received assertion from IdP ~w', [IssuerName]),
         ( member(element(DS:'Signature', _, Signature), Assertion)->
-            xmld_verify_signature(Document, Signature, Certificate, Options),
+            xmld_verify_signature(Document, Signature, Certificate, []),
             certificate_is_trusted(ServiceProvider, IssuerName, Certificate)
         ; otherwise->
             % Technically the standard allows this, but it seems like practically it would be useless?
@@ -264,7 +283,8 @@ process_assertion(ServiceProvider, Document, Attributes, Assertion, AssertionPre
                    ( memberchk('Name'=Name, AttributeAttributes),
                      memberchk(element(SAML:'AttributeValue', _, [Value]), Attribute),
                      Key = saml(Name, Value),
-                     http_session_assert(Key)
+                     writeln(assert(Key))
+                     %http_session_assert(Key)
                    ))
         ; true
 	).
@@ -393,26 +413,3 @@ recode_1([A|As], [A|Bs]):-
         recode_1(As, Bs).
 
 
-
-/*
-% Target
-SAMLRequest=fZHdSsNAEIVfJex9fjbWJi5JILQIBRWx4oV3m83ELiS7dWfW1Ld3aStYQW9nzjeHc6Y6GMx5KVpPO%2FME7x6QosM0GhSnTc28M8JK1CiMnAAFKbFt7%2B9EnmRi7yxZZUf2kyn%2BZyQiONLWsGizrpksh2U39Bzi4lrlMeewjEt508XQLQYFRdEVxcCiF3AYmJqFEwFE9LAxSNJQGGV8GWc3cVY%2B81wsSnFVvLKo%2FfZZWYN%2BArcF96FVwHo41CxcaYmc7jzBSaHN229JU50SiaOha3ZEe5Gm8zwnCMo7TSAREmWnKr1UVudiH0L%2BzfrRjlp9Ru042nnlQBLUjJwHFt1aN0n6uzGe8ONE9%2FFwlApvcA9KDxp6ljZn38sPNl8%3D&RelayState=x&SigAlg=http%3A%2F%2Fwww.w3.org%2F2000%2F09%2Fxmldsig%23rsa-sha1
-
-% Current
-SAMLRequest=fZHdSsNAEIVfJex9fjbWJi5JILQIBRWx4oV3m83ELiS7dWfW1Ld3aStYQW9nzjeHc6Y6GMx5KVpPO%2FME7x6QosM0GhSnTc28M8JK1CiMnAAFKbFt7%2B9EnmRi7yxZZUf2kyn%2BZyQiONLWsGizrpksh2U39Bzi4lrlMeewjEt508XQLQYFRdEVxcCiF3AYmJqFEwFE9LAxSNJQGGV8GWc3cVY%2B81wsSnFVvLKo%2FfZZWYN%2BArcF96FVwHo41CxcaYmc7jzBSaHN229JU50SiaOha3ZEe5Gm8zwnCMo7TSAREmWnKr1UVudiH0L%2BzfrRjlp9Ru042nnlQBLUjJwHFt1aN0n6uzGe8ONE9%2FFwlApvcA9KDxp6ljZn38sPNl8%3D&RelayState=x&SigAlg=http%3A%2F%2Fwww.w3.org%2F2000%2F09%2Fxmldsig%23rsa-sha1
-
-*/
-
-qqz:-
-        setup_call_cleanup(new_memory_file(MemFile),
-                           ( setup_call_cleanup(open_memory_file(MemFile, write, MemWrite, [encoding(octet)]),
-                                                ( setup_call_cleanup(zopen(MemWrite, Write, [format(raw_deflate), level(9), close_parent(false)]),
-                                                                     format(Write, '~w', ['<xns218:AuthnRequest xmlns:xns218="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:xns217="urn:oasis:names:tc:SAML:2.0:assertion" ID="a8f6bfd1e-75c2-11e6-8a9b-eb4fce77b77f" Version="2.0" IssueInstant="2016-09-08T12:48:37Z" AssertionConsumerServiceIndex="0" AttributeConsumingServiceIndex="0"><xns217:Issuer>http://www.securitease.com</xns217:Issuer><xns218:NameIDPolicy AllowCreate="true" Format="urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified"/></xns218:AuthnRequest>']),
-                                                                     close(Write))
-                                                ),
-                                                close(MemWrite)),
-                             memory_file_to_atom(MemFile, SAMLRequestRaw)
-                           ),
-                           free_memory_file(MemFile)),
-        ??base64(SAMLRequestRaw, SAMLRequest),
-        format(user_error, 'Request:~n~w~n', [SAMLRequest]).
