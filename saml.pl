@@ -148,7 +148,7 @@ process_response(XML, ServiceProvider, Options):-
 	),
 
         ( member(element(ns(_, DS):'Signature', _, Signature), Response)->
-            xmld_verify_signature(Signature, Certificate, []),
+            xmld_verify_signature(Signature, XML, Certificate, []),
             certificate_is_trusted(ServiceProvider, IssuerName, Certificate)
         ; otherwise->
             % Warning: Message is not signed. Assertions may be though
@@ -173,16 +173,16 @@ process_response(XML, ServiceProvider, Options):-
 
         % Response MAY also contain 0..N of the following elements: Assertion, EncryptedAssertion.
         forall(member(element(ns(SAMLPrefix, SAML):'Assertion', AssertionAttributes, Assertion), Response),
-               process_assertion(ServiceProvider, AssertionAttributes, Assertion, SAMLPrefix=SAML, NSMap)),
+               process_assertion(ServiceProvider, XML, AssertionAttributes, Assertion, SAMLPrefix=SAML, NSMap)),
         forall(member(element(ns(SAMLPrefix, SAML):'EncryptedAssertion', _, EncryptedAssertion), Response),
                ( decrypt_xml(EncryptedAssertion, DecryptedAssertion, saml:saml_key_callback(ServiceProvider), Options),
 		 forall(member(element(SAML:'Assertion', AssertionAttributes, Assertion), DecryptedAssertion),
-                        process_assertion(ServiceProvider, AssertionAttributes, Assertion, SAMLPrefix=SAML, NSMap))
+                        process_assertion(ServiceProvider, XML, AssertionAttributes, Assertion, SAMLPrefix=SAML, NSMap))
                )
 	      ).
 
 
-process_assertion(ServiceProvider, Attributes, Assertion, AssertionPrefix=AssertionURI, NSMap):-
+process_assertion(ServiceProvider, Document, Attributes, Assertion, AssertionPrefix=AssertionURI, NSMap):-
         (  AssertionPrefix == ''
         -> Options = [nsmap(NSMap)]
         ;  Options = [nsmap([AssertionPrefix=AssertionURI|NSMap])]
@@ -202,7 +202,7 @@ process_assertion(ServiceProvider, Attributes, Assertion, AssertionPrefix=Assert
         memberchk(element(SAML:'Issuer', _, [IssuerName]), Assertion),
         debug(saml, 'Received assertion from IdP ~w', [IssuerName]),
         ( member(element(DS:'Signature', _, Signature), Assertion)->
-            ??xmld_verify_signature(Signature, Certificate, Options),
+            xmld_verify_signature(Document, Signature, Certificate, Options),
             certificate_is_trusted(ServiceProvider, IssuerName, Certificate)
         ; otherwise->
             % Technically the standard allows this, but it seems like practically it would be useless?
@@ -269,7 +269,7 @@ process_assertion(ServiceProvider, Attributes, Assertion, AssertionPrefix=Assert
         ; true
 	).
 
-process_assertion(_Attributes, _Assertion):-
+process_assertion(_Attributes, _Assertion, _, _, _, _):-
 	debug(saml, 'Warning: Assertion was not valid', []).
 
 condition_holds(_ConditionAttributes, _Condition):-
