@@ -1,5 +1,5 @@
 :-module(saml,
-         [saml_authenticate/3,
+         [saml_authenticate/4,
           trust_saml_idp/2]).
 
 
@@ -111,17 +111,10 @@ form_authn_request(Request, ID, Destination, Date, ServiceProvider, ExtraElement
                                                       'Format'='urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified'], [])|ExtraElements]).
 
 
-http:authenticate(saml(ServiceProvider, IdentityProvider), Request, [user_id(UserId)]):-
-        ( http_in_session(_),
-          % FIXME: hard-coded
-          http_session_data(saml('the-username', UserId))->
-            true
-        ; otherwise->
-            saml_authenticate(ServiceProvider, IdentityProvider, Request)
-        ).
 
-saml_authenticate(ServiceProvider, IdentityProvider, Request):-
-        memberchk(request_uri(RelayState), Request),
+saml_authenticate(ServiceProvider, IdentityProvider, Callback, Request):-
+        memberchk(request_uri(RequestingURI), Request),
+        format(atom(RelayState), '~q', [saml(RequestingURI, Callback)]),
         get_xml_timestamp(Date),
         uuid(UUID),
         % the ID must start with a letter but the UUID may start with a number. Resolve this by prepending an 'a'
@@ -191,6 +184,10 @@ saml_acs_handler(ServiceProvider, Options, Request):-
         debug(saml, '~w~n', [PostedData]),
         memberchk('SAMLResponse'=Atom, PostedData),
         memberchk('RelayState'=Relay, PostedData),
+        (  atom_to_term(Relay, saml(OriginalURI, Callback), _)
+        -> true
+        ;  throw(error(invalid_request, _))
+        ),
         base64(RawData, Atom),
         atom_string(RawData, RawString),
         setup_call_cleanup(open_string(RawString, Stream),
@@ -200,8 +197,8 @@ saml_acs_handler(ServiceProvider, Options, Request):-
         -> xml_write(user_error, XML, [])
         ;  true
         ),
-        process_saml_response(XML, ServiceProvider, fixme, Options),
-        http_redirect(moved_temporary, Relay, Request).
+        process_saml_response(XML, ServiceProvider, Callback, Options),
+        http_redirect(moved_temporary, OriginalURI, Request).
 
 
 propagate_ns([], _, []):- !.
@@ -244,12 +241,11 @@ process_saml_response(XML0, ServiceProvider, Callback, Options):-
                 % StatusCode MUST contain a Value attribute
                 ( memberchk('Value'=StatusCodeValue, StatusCodeAttributes)->
                     true
-                % FIXME: Fix all these throw(atom) calls
-                ; throw(illegal_saml_response)
+                ; domain_error(legal_saml_response, XML0)
                 )
-            ; throw(illegal_saml_response)
+            ; domain_error(legal_saml_response, XML0)
             )
-        ; throw(illegal_saml_response)
+        ; domain_error(legal_saml_response, XML0)
 	),
         (  memberchk(element(ns(_, SAML):'Issuer', _, [IssuerName]), Response)
 	-> true
@@ -270,9 +266,9 @@ process_saml_response(XML0, ServiceProvider, Callback, Options):-
         ),
 
         ( StatusCodeValue == 'urn:oasis:names:tc:SAML:2.0:status:Success'->
-            % The user has authenticated in some capacity. We can now open a session for them
+            % The user has authenticated in some capacity.
             % Note that we cannot say anything ABOUT the user yet. That will come once we process the assertions
-            http_open_session(_, [])
+            true
         ; StatusCodeValue == 'urn:oasis:names:tc:SAML:2.0:status:Requester'->
             throw(saml_rejected(requester))
         ; StatusCodeValue == 'urn:oasis:names:tc:SAML:2.0:status:Responder'->
@@ -283,18 +279,19 @@ process_saml_response(XML0, ServiceProvider, Callback, Options):-
         ),
 
         % Response MAY also contain 0..N of the following elements: Assertion, EncryptedAssertion.
-        findall(AttributeName=AttributeValue,
+        findall(Attribute,
                 ( ( member(element(ns(SAMLPrefix, SAML):'Assertion', AssertionAttributes, Assertion), Response),
-                    process_assertion(ServiceProvider, IssuerName, XML, AssertionAttributes, Assertion, AttributeName, AttributeValue))
+                    process_assertion(ServiceProvider, IssuerName, XML, AssertionAttributes, Assertion, Attribute))
                 ; member(element(ns(SAMLPrefix, SAML):'EncryptedAssertion', _, EncryptedAssertion), Response),
                   decrypt_xml(EncryptedAssertion, DecryptedAssertion, saml:saml_key_callback(ServiceProvider), Options),
                   member(element(ns(_, SAML):'Assertion', AssertionAttributes, Assertion), DecryptedAssertion),
-                  process_assertion(ServiceProvider, IssuerName, XML, AssertionAttributes, Assertion, AttributeName, AttributeValue)
+                  process_assertion(ServiceProvider, IssuerName, XML, AssertionAttributes, Assertion, Attribute)
                 ),
                 AcceptedAttributes),
+        debug(saml, 'Calling SAML callback with these attributes: ~w', [AcceptedAttributes]),
         call(Callback, AcceptedAttributes).
 
-process_assertion(ServiceProvider, _EntityID, Document, Attributes, Assertion, AttributeName, AttributeValue):-
+process_assertion(ServiceProvider, _EntityID, Document, Attributes, Assertion, AssertedAttribute):-
         format(user_error, '~n~n~n', []),
         xml_write(user_error, element('Object', Attributes, Assertion), []),
         format(user_error, '~n~n~n', []),
@@ -380,7 +377,12 @@ process_assertion(ServiceProvider, _EntityID, Document, Attributes, Assertion, A
         memberchk(element(SAML:'AttributeStatement', _, AttributeStatement), Assertion),
         member(element(SAML:'Attribute', AttributeAttributes, Attribute), AttributeStatement),
         memberchk('Name'=AttributeName, AttributeAttributes),
-        memberchk(element(SAML:'AttributeValue', _, [AttributeValue]), Attribute).
+        (  memberchk('FriendlyName'=FriendlyName, AttributeAttributes)
+        -> true
+        ;  FriendlyName = ''
+        ),
+        memberchk(element(SAML:'AttributeValue', _, [AttributeValue]), Attribute),
+        AssertedAttribute = attribute(AttributeName, FriendlyName, AttributeValue).
 
 process_assertion(_Attributes, _Assertion, _, _, _, _):-
 	debug(saml, 'Warning: Assertion was not valid', []).
