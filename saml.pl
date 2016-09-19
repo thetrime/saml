@@ -1,10 +1,106 @@
+/*  Part of SWI-Prolog
+
+    Author:        Matt Lilley
+    E-mail:        thetrime@gmail.com
+    WWW:           http://www.swi-prolog.org
+    Copyright (c)  2004-2016, SWI-Prolog Foundation
+                              VU University Amsterdam
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions
+    are met:
+
+    1. Redistributions of source code must retain the above copyright
+       notice, this list of conditions and the following disclaimer.
+
+    2. Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in
+       the documentation and/or other materials provided with the
+       distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+    "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+    LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+    FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+    COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+    INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+    BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+    LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+    CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+    LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+    ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
+*/
+
 :-module(saml,
          [saml_authenticate/4]).
+
+/** <module> SAML Authentication
+
+This library uses SAML to exchange messages with an Identity Provider to establish
+assertions about the current user's session. It operates only as the service end, not
+the identity provider end.
+
+@see https://docs.oasis-open.org/security/saml/v2.0/saml-core-2.0-os.pdf
+
+There are four primary integration points for applications to use this code:
+   1) You must declare at least one service provider (SP)
+   2) You must declare at least one identity provider (IdP) per SP
+   3) Finally, you can call saml_authenticate(+SP, +IdP, +Callback, +Request) to obtain assertions
+      The asynchronous nature of the SAML process means that a callback must be used. Assuming
+      that the IdP was able to provide at least some valid assertions about the user, after calling
+      Callback with 2 extra arguments (a list of the assertion terms and the URL being request by
+      the user), the user will be redirected back to their original URL. It is therefore up to the
+      callback to ensure that this does not simply trigger another round of SAML negotiations - for
+      example, by throwing http_reply(forbidden(RequestURL)) if the assertions are not strong enough
+   4) Finally, your SP metadata will be available from the web server directly. This is required to
+      configure the IdP. This will be available at './metadata.xml', relative to the LocationSpec
+      provided when the SP was declared.
+
+   Configuring an SP:
+   To declare an SP, use the declaration
+      :-saml_sp(+ServiceProvider: atom,
+                +LocationSpec:    term,
+                +PrivateKeySpec:  term,
+                +Password:        atom
+                +CertificateSpec: term,
+                +Options:         list).
+
+   The ServiceProvider is the identifier of your service. Ideally, this should be a fully-qualified URI
+   The LocationSpec is a location that the HTTP dispatch layer will understand
+      for example '.' or root('saml').
+   The Private KeySpec is a 'file specifier' that resolves to a private key (see below for specifiers)
+   The Password is a password used for reading the private key. If the key is not encrypted, any atom
+      can be supplied as it will be ignored
+   The CertificateSpec is a file specifier that resolves to a certificate holding the public key
+      corresponding to PrivateKeySPec
+   There are currently no implemented options (the list is ignored).
+
+   Configuring an IdP:
+   To declare an IdP, use the declaration
+      :-saml_idp(+ServiceProvider: atom,
+                 +MetadataSpec:    term).
+   ServiceProvider is the identifier used when declaring your SP. You do not need to declare them in a
+      particular order, but both must be present in the system before running saml_authenticate/4.
+   MetadataSpec is a file specifier that resolves to the metadata for the IdP. Most IdPs will be able
+      to provide this on request
+
+
+   File Specifiers:
+   The following specifiers are supported for locating files:
+      * file(Filename): The local file Filename
+      * resource(Resource): The prolog resource Resource. See resource/3
+      * url(URL): The file identified by the HTTP (or HTTPS if you have the HTTPS plugin loaded) URL
+
+
+
+*/
 
 user:term_expansion(:-saml_idp(ServiceProvider, MetadataFile), Clauses):-
         saml_idp_clauses(ServiceProvider, MetadataFile, Clauses).
 
-user:term_expansion(:-saml_service(ServiceProvider, Spec, KeyFile, Password, CertFile, Options),
+user:term_expansion(:-saml_sp(ServiceProvider, Spec, KeyFile, Password, CertFile, Options),
                     [saml:saml_acs_path(ServiceProvider, ACSPath),
                      saml:saml_sp_certificate(ServiceProvider, Certificate, PEMData, PrivateKey),
                      ( :-http_handler(MetadataPath, saml:saml_metadata(ServiceProvider, Options), [])),
