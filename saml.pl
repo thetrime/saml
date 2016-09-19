@@ -1,74 +1,88 @@
 :-module(saml,
-         [saml_authenticate/4,
-          trust_saml_idp/2]).
+         [saml_authenticate/4]).
 
+user:term_expansion(:-saml_idp(ServiceProvider, MetadataFile), Clauses):-
+        saml_idp_clauses(ServiceProvider, MetadataFile, Clauses).
 
-user:term_expansion(:-saml_service(ServiceProvider, Spec, Options),
+user:term_expansion(:-saml_service(ServiceProvider, Spec, KeyFile, Password, CertFile, Options),
                     [saml:saml_acs_path(ServiceProvider, ACSPath),
+                     saml:saml_sp_certificate(ServiceProvider, Certificate, PEMData, PrivateKey),
                      ( :-http_handler(MetadataPath, saml:saml_metadata(ServiceProvider, Options), [])),
                      ( :-http_handler(ACSPath, saml:saml_acs_handler(ServiceProvider, Options), []))]):-
         http_absolute_location(Spec, Root, []),
         atom_concat(Root, '/auth', ACSPath),
-        atom_concat(Root, '/metadata.xml', MetadataPath).
+        atom_concat(Root, '/metadata.xml', MetadataPath),
+        read_key(KeyFile, Password, PrivateKey),
+        read_certificate(CertFile, Certificate, PEMData).
 
+read_key(Spec, Password, Key):-
+        setup_call_cleanup(open_spec(Spec, Stream),
+                           load_private_key(Stream, Password, Key),
+                           close(Stream)).
 
-%%          Configuration
-%           Your code must define these 3 rules in order to act as a service provider
-%           Additionally, you should declare saml_acs(ServiceProvide, PathSpec, Options) to declare some path on your server
-%           that we can use for callbacks
-:-multifile(saml:saml_certificate/4).
-:-multifile(saml:saml_audience/2).
-% End configuration
+read_certificate(Spec, Certificate, PEMData):-
+        setup_call_cleanup(open_spec(Spec, Stream1),
+                           read_string(Stream1, _, PEMData),
+                           close(Stream1)),
+        setup_call_cleanup(open_string(PEMData, Stream2),
+                           load_certificate(Stream2, Certificate),
+                           close(Stream2)).
 
+open_spec(Spec, Stream):-
+        (  Spec = file(Filename)
+        -> open(Filename, read, Stream)
+        ;  Spec = resource(Name)
+        -> open_resource(Name, read, Stream)
+        ;  Spec = url(URL)
+        -> http_open(URL, Stream, [])
+        ;  domain_error(file_specification, Spec)
+        ).
 
-:-dynamic(saml:saml_idp/3).
-:-dynamic(saml:saml_idp_certificate/4).
-:-dynamic(saml:saml_idp_binding/4).
+:-multifile(saml:saml_sp_certificate/4).
+:-multifile(saml:saml_idp/3).
+:-multifile(saml:saml_idp_certificate/4).
+:-multifile(saml:saml_idp_binding/4).
 :-multifile(saml:saml_acs_path/2).
 
-trust_saml_idp(ServiceProvider, MetadataFile):-
-        setup_call_cleanup(open(MetadataFile, read, Stream),
+saml_idp_clauses(ServiceProvider, MetadataSpec, Clauses):-
+        setup_call_cleanup(open_spec(MetadataSpec, Stream),
                            load_structure(Stream, Metadata, [dialect(xmlns)]),
                            close(Stream)),
         (  memberchk(element('urn:oasis:names:tc:SAML:2.0:metadata':'EntitiesDescriptor', _, EntitiesDescriptor), Metadata)
         -> (  memberchk(element('urn:oasis:names:tc:SAML:2.0:metadata':'EntityDescriptor', EntityDescriptorAttributes, EntityDescriptor), EntitiesDescriptor),
               memberchk(element('urn:oasis:names:tc:SAML:2.0:metadata':'IDPSSODescriptor', IDPSSODescriptorAttributes, IDPSSODescriptor), EntityDescriptor)
-           -> trust_saml_idp_descriptor(ServiceProvider, EntityDescriptorAttributes, IDPSSODescriptorAttributes, IDPSSODescriptor)
-           ;  existence_error(idp_descriptor, MetadataFile)
+           -> trust_saml_idp_descriptor(ServiceProvider, EntityDescriptorAttributes, IDPSSODescriptorAttributes, IDPSSODescriptor, Clauses)
+           ;  existence_error(idp_descriptor, MetadataSpec)
            )
         ;  memberchk(element('urn:oasis:names:tc:SAML:2.0:metadata':'EntityDescriptor', EntityDescriptorAttributes, EntityDescriptor), Metadata),
            memberchk(element('urn:oasis:names:tc:SAML:2.0:metadata':'IDPSSODescriptor', IDPSSODescriptorAttributes, IDPSSODescriptor), EntityDescriptor)
-        -> trust_saml_idp_descriptor(ServiceProvider, EntityDescriptorAttributes, IDPSSODescriptorAttributes, IDPSSODescriptor)
-        ;  existence_error(idp_descriptor, MetadataFile)
+        -> trust_saml_idp_descriptor(ServiceProvider, EntityDescriptorAttributes, IDPSSODescriptorAttributes, IDPSSODescriptor, Clauses)
+        ;  existence_error(idp_descriptor, MetadataSpec)
         ).
 
-trust_saml_idp_descriptor(ServiceProvider, EntityDescriptorAttributes, IDPSSODescriptorAttributes, IDPSSODescriptor):-
+trust_saml_idp_descriptor(ServiceProvider,
+                          EntityDescriptorAttributes,
+                          IDPSSODescriptorAttributes,
+                          IDPSSODescriptor,
+                          [saml:saml_idp(ServiceProvider, EntityID, MustSign)|Clauses]):-
         memberchk(entityID=EntityID, EntityDescriptorAttributes),
-        findall(CertificateUse-Certificate,
-                idp_certificate(IDPSSODescriptor, CertificateUse, Certificate),
-                Certificates),
-        findall(binding(Binding, BindingInfo),
+        findall(saml:saml_idp_binding(ServiceProvider, EntityID, Binding, BindingInfo),
                 ( member(element('urn:oasis:names:tc:SAML:2.0:metadata':'SingleSignOnService', SingleSignOnServiceAttributes, SingleSignOnService), IDPSSODescriptor),
                   process_saml_binding(SingleSignOnServiceAttributes, SingleSignOnService, Binding, BindingInfo)
                 ),
-                Bindings),
-        (  Bindings == []
+                Clauses,
+                Tail),
+        (  Tail == Clauses
         -> existence_error(supported_binding, IDPSSODescriptor)
         ;  true
         ),
+        findall(saml:saml_idp_certificate(ServiceProvider, EntityID, CertificateUse, Certificate),
+                idp_certificate(IDPSSODescriptor, CertificateUse, Certificate),
+                Tail),
         (  memberchk('WantAuthnRequestsSigned'=true, IDPSSODescriptorAttributes)
         -> MustSign = true
         ;  MustSign = false
-        ),
-
-        retractall(saml_idp(ServiceProvider, EntityID, _)),
-        retractall(saml_idp_binding(ServiceProvider, EntityID, _, _)),
-        retractall(saml_idp_certificate(ServiceProvider, EntityID, _, _)),
-        assert(saml_idp(ServiceProvider, EntityID, MustSign)),
-        forall(member(CertificateUse-Certificate, Certificates),
-               assert(saml_idp_certificate(ServiceProvider, EntityID, CertificateUse, Certificate))),
-        forall(member(binding(Binding, BindingInfo), Bindings),
-               assert(saml_idp_binding(ServiceProvider, EntityID, Binding, BindingInfo))).
+        ).
 
 idp_certificate(IDPSSODescriptor, CertificateUse, Certificate):-
         member(element('urn:oasis:names:tc:SAML:2.0:metadata':'KeyDescriptor', KeyDescriptorAttributes, KeyDescriptor), IDPSSODescriptor),
@@ -143,14 +157,14 @@ saml_authenticate(ServiceProvider, IdentityProvider, Callback, Request):-
         (  saml_idp_binding(ServiceProvider, IdentityProvider, 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect', BaseURL)
         -> parse_url(BaseURL, Parts),
            (  MustSign == true
-           -> saml_certificate(ServiceProvider, _, _, PrivateKey),
+           -> saml_sp_certificate(ServiceProvider, _, _, PrivateKey),
               saml_sign(PrivateKey, XMLString, SAMLRequest, RelayState, ExtraParameters)
            ;  ExtraParameters = []
            )
         ; domain_error(supported_binding, IdentityProvider)
         ),
         parse_url(IdPURL, [search(['SAMLRequest'=SAMLRequest, 'RelayState'=RelayState|ExtraParameters])|Parts]),
-        format(user_error, 'Redirecting user to~n~w~n', [IdPURL]),
+        debug(saml, 'Redirecting user to~n~w~n', [IdPURL]),
         http_redirect(moved_temporary, IdPURL, Request).
 
 saml_simple_sign(PrivateKey, XMLString, _SAMLRequest, RelayState, ['SigAlg'=SigAlg,'Signature'=Signature]):-
@@ -292,9 +306,6 @@ process_saml_response(XML0, ServiceProvider, Callback, Options):-
         call(Callback, AcceptedAttributes).
 
 process_assertion(ServiceProvider, _EntityID, Document, Attributes, Assertion, AssertedAttribute):-
-        format(user_error, '~n~n~n', []),
-        xml_write(user_error, element('Object', Attributes, Assertion), []),
-        format(user_error, '~n~n~n', []),
         SAML = ns(_, 'urn:oasis:names:tc:SAML:2.0:assertion'),
 	DS = ns(_, 'http://www.w3.org/2000/09/xmldsig#'),
         ( memberchk('ID'=_AssertionID, Attributes)->
@@ -337,10 +348,10 @@ process_assertion(ServiceProvider, _EntityID, Document, Attributes, Assertion, A
             forall(member(element(SAML:'Condition', ConditionAttributes, Condition), Conditions),
                    condition_holds(ConditionAttributes, Condition)),
             forall(member(element(SAML:'AudienceRestriction', _AudienceRestrictionAttributes, AudienceRestriction), Conditions),
-		   ( member(element(SAML:'Audience', _, [Audience]), AudienceRestriction),
-                     saml_audience(ServiceProvider, Audience)->
-                       true
-                   ; true %throw(illegal_audience) % FIXME: How do you determine the 'audience' exactly?
+                   (  member(element(SAML:'Audience', _, [Audience]), AudienceRestriction),
+                      Audience == ServiceProvider
+                   -> true
+                   ;  permission_error(accept, assertion, Audience)
                    )),
             ( memberchk(element(SAML:'OneTimeUse', _, _), Conditions)->
                 throw(one_time_use_not_supported)
@@ -424,13 +435,13 @@ subject_confirmation_is_valid(SubjectConfirmationAttributes, SubjectConfirmation
         true.
 
 saml_key_callback(ServiceProvider, certificate, KeyHint, Key):-
-	saml_certificate(ServiceProvider, KeyHint, _, Key), !.
+        saml_sp_certificate(ServiceProvider, KeyHint, _, Key), !.
 
 
 saml_metadata(ServiceProvider, _Options, Request):-
 	MD = 'urn:oasis:names:tc:SAML:2.0:metadata',
         DS = 'http://www.w3.org/2000/09/xmldsig#',
-        saml_certificate(ServiceProvider, _X509Certificate, X509Certificate, _PrivateKey),
+        saml_sp_certificate(ServiceProvider, _X509Certificate, X509Certificate, _PrivateKey),
 
         % All of this should be configurable, eventually?
         EncryptionMethod = 'http://www.w3.org/2009/xmlenc11#rsa-oaep',
