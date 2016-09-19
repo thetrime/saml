@@ -211,7 +211,7 @@ saml_acs_handler(ServiceProvider, Options, Request):-
         -> xml_write(user_error, XML, [])
         ;  true
         ),
-        process_saml_response(XML, ServiceProvider, Callback, Options),
+        process_saml_response(XML, ServiceProvider, Callback, OriginalURI, Options),
         http_redirect(moved_temporary, OriginalURI, Request).
 
 
@@ -239,7 +239,7 @@ merge_ns([xmlns:Prefix=Value|NS], Attributes, NewAttributes, NewNS):-
 merge_ns([], A, A, NS):-
         findall(xmlns:Prefix=Value, member(xmlns:Prefix=Value, A), NS).
 
-process_saml_response(XML0, ServiceProvider, Callback, Options):-
+process_saml_response(XML0, ServiceProvider, Callback, RequestURL, Options):-
         SAMLP = 'urn:oasis:names:tc:SAML:2.0:protocol',
         SAML = 'urn:oasis:names:tc:SAML:2.0:assertion',
         DS = 'http://www.w3.org/2000/09/xmldsig#',
@@ -303,7 +303,7 @@ process_saml_response(XML0, ServiceProvider, Callback, Options):-
                 ),
                 AcceptedAttributes),
         debug(saml, 'Calling SAML callback with these attributes: ~w', [AcceptedAttributes]),
-        call(Callback, AcceptedAttributes).
+        call(Callback, RequestURL, AcceptedAttributes).
 
 process_assertion(ServiceProvider, _EntityID, Document, Attributes, Assertion, AssertedAttribute):-
         SAML = ns(_, 'urn:oasis:names:tc:SAML:2.0:assertion'),
