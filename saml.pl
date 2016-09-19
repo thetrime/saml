@@ -1,5 +1,6 @@
 :-module(saml,
-         [trust_saml_idp/2]).
+         [saml_authenticate/3,
+          trust_saml_idp/2]).
 
 
 user:term_expansion(:-saml_service(ServiceProvider, Spec, Options),
@@ -16,50 +17,83 @@ user:term_expansion(:-saml_service(ServiceProvider, Spec, Options),
 %           Additionally, you should declare saml_acs(ServiceProvide, PathSpec, Options) to declare some path on your server
 %           that we can use for callbacks
 :-multifile(saml:saml_certificate/4).
-:-multifile(saml:saml_simple_sign/2).
 :-multifile(saml:saml_audience/2).
 % End configuration
 
 
-
-:-multifile(saml:saml_idp/2).
-:-dynamic(saml:saml_idp/2).
-:-dynamic(saml:certificate_is_trusted/3).
+:-dynamic(saml:saml_idp/3).
+:-dynamic(saml:saml_idp_certificate/4).
+:-dynamic(saml:saml_idp_binding/4).
 :-multifile(saml:saml_acs_path/2).
 
 trust_saml_idp(ServiceProvider, MetadataFile):-
         setup_call_cleanup(open(MetadataFile, read, Stream),
                            load_structure(Stream, Metadata, [dialect(xmlns)]),
                            close(Stream)),
-        memberchk(element('urn:oasis:names:tc:SAML:2.0:metadata':'EntityDescriptor', EntityDescriptorAttributes, EntityDescriptor), Metadata),
-        memberchk(element('urn:oasis:names:tc:SAML:2.0:metadata':'IDPSSODescriptor', _IDPSSODescriptorAttributes, IDPSSODescriptor), EntityDescriptor),
-        memberchk(element('urn:oasis:names:tc:SAML:2.0:metadata':'KeyDescriptor', _KeyDescriptorAttributes, KeyDescriptor), IDPSSODescriptor),
+        (  memberchk(element('urn:oasis:names:tc:SAML:2.0:metadata':'EntitiesDescriptor', _, EntitiesDescriptor), Metadata)
+        -> (  memberchk(element('urn:oasis:names:tc:SAML:2.0:metadata':'EntityDescriptor', EntityDescriptorAttributes, EntityDescriptor), EntitiesDescriptor),
+              memberchk(element('urn:oasis:names:tc:SAML:2.0:metadata':'IDPSSODescriptor', IDPSSODescriptorAttributes, IDPSSODescriptor), EntityDescriptor)
+           -> trust_saml_idp_descriptor(ServiceProvider, EntityDescriptorAttributes, IDPSSODescriptorAttributes, IDPSSODescriptor)
+           ;  existence_error(idp_descriptor, MetadataFile)
+           )
+        ;  memberchk(element('urn:oasis:names:tc:SAML:2.0:metadata':'EntityDescriptor', EntityDescriptorAttributes, EntityDescriptor), Metadata),
+           memberchk(element('urn:oasis:names:tc:SAML:2.0:metadata':'IDPSSODescriptor', IDPSSODescriptorAttributes, IDPSSODescriptor), EntityDescriptor)
+        -> trust_saml_idp_descriptor(ServiceProvider, EntityDescriptorAttributes, IDPSSODescriptorAttributes, IDPSSODescriptor)
+        ;  existence_error(idp_descriptor, MetadataFile)
+        ).
+
+trust_saml_idp_descriptor(ServiceProvider, EntityDescriptorAttributes, IDPSSODescriptorAttributes, IDPSSODescriptor):-
+        memberchk(entityID=EntityID, EntityDescriptorAttributes),
+        findall(CertificateUse-Certificate,
+                idp_certificate(IDPSSODescriptor, CertificateUse, Certificate),
+                Certificates),
+        findall(binding(Binding, BindingInfo),
+                ( member(element('urn:oasis:names:tc:SAML:2.0:metadata':'SingleSignOnService', SingleSignOnServiceAttributes, SingleSignOnService), IDPSSODescriptor),
+                  process_saml_binding(SingleSignOnServiceAttributes, SingleSignOnService, Binding, BindingInfo)
+                ),
+                Bindings),
+        (  Bindings == []
+        -> existence_error(supported_binding, IDPSSODescriptor)
+        ;  true
+        ),
+        (  memberchk('WantAuthnRequestsSigned'=true, IDPSSODescriptorAttributes)
+        -> MustSign = true
+        ;  MustSign = false
+        ),
+
+        retractall(saml_idp(ServiceProvider, EntityID, _)),
+        retractall(saml_idp_binding(ServiceProvider, EntityID, _, _)),
+        retractall(saml_idp_certificate(ServiceProvider, EntityID, _, _)),
+        assert(saml_idp(ServiceProvider, EntityID, MustSign)),
+        forall(member(CertificateUse-Certificate, Certificates),
+               assert(saml_idp_certificate(ServiceProvider, EntityID, CertificateUse, Certificate))),
+        forall(member(binding(Binding, BindingInfo), Bindings),
+               assert(saml_idp_binding(ServiceProvider, EntityID, Binding, BindingInfo))).
+
+idp_certificate(IDPSSODescriptor, CertificateUse, Certificate):-
+        member(element('urn:oasis:names:tc:SAML:2.0:metadata':'KeyDescriptor', KeyDescriptorAttributes, KeyDescriptor), IDPSSODescriptor),
+        memberchk(use=CertificateUse, KeyDescriptorAttributes),
         memberchk(element('http://www.w3.org/2000/09/xmldsig#':'KeyInfo', _, KeyInfo), KeyDescriptor),
         memberchk(element('http://www.w3.org/2000/09/xmldsig#':'X509Data', _, X509Data), KeyInfo),
         memberchk(element('http://www.w3.org/2000/09/xmldsig#':'X509Certificate', _, [X509CertificateData]), X509Data),
         normalize_space(string(TrimmedCertificate), X509CertificateData),
         format(string(CompleteCertificate), '-----BEGIN CERTIFICATE-----\n~s\n-----END CERTIFICATE-----', [TrimmedCertificate]),
         setup_call_cleanup(open_string(CompleteCertificate, StringStream),
-                           load_certificate(StringStream, IdPCertificate),
-                           close(StringStream)),
-        memberchk(element('urn:oasis:names:tc:SAML:2.0:metadata':'SingleSignOnService', SingleSignOnServiceAttributes, _), IDPSSODescriptor),
-        memberchk('Binding'=Binding, SingleSignOnServiceAttributes),
-        memberchk('Location'=Location, SingleSignOnServiceAttributes),
-        memberchk(entityID=EntityID, EntityDescriptorAttributes),
-        (  Binding == 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect'
-        -> true
-        ;  domain_error(supported_binding, Binding)
-        ),
-        retractall(saml_idp(ServiceProvider, _)),
-        retractall(certificate_is_trusted(ServiceProvider, _)),
-        assert(saml_idp(ServiceProvider, Location)),
-        assert(certificate_is_trusted(ServiceProvider, EntityID, IdPCertificate)).
+                           load_certificate(StringStream, Certificate),
+                           close(StringStream)).
+
+
+process_saml_binding(SingleSignOnServiceAttributes, _, 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect', Location):-
+        memberchk('Binding'='urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect', SingleSignOnServiceAttributes), !,
+        memberchk('Location'=Location, SingleSignOnServiceAttributes).
+
+process_saml_binding(SingleSignOnServiceAttributes, _, 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST', Location):-
+        memberchk('Binding'='urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST', SingleSignOnServiceAttributes), !,
+        memberchk('Location'=Location, SingleSignOnServiceAttributes).
 
 
 
-
-
-form_authn_request(Request, ID, Date, ServiceProvider, ExtraElements, XML):-
+form_authn_request(Request, ID, Destination, Date, ServiceProvider, ExtraElements, XML):-
         saml_acs_path(ServiceProvider, Path),
         select(path(_), Request, Request1),
         parse_url(ACSURL, [path(Path)|Request1]),
@@ -68,61 +102,68 @@ form_authn_request(Request, ID, Date, ServiceProvider, ExtraElements, XML):-
         XML = element(SAMLP:'AuthnRequest', ['ID'=ID,
                                              'Version'='2.0',
                                              'IssueInstant'=Date,
-                                             %'Destination'=Destination,
-                                             %'ForceAuthn'=false,
+                                             'Destination'=Destination,
                                              'IsPassive'=false,
-                                             'ProtocolBinding'='urn:oasis:names:tc:SAML:2.0:bindings:HTTP-GET',
+                                             'ProtocolBinding'='urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST',
                                              'AssertionConsumerServiceURL'=ACSURL],
                       [element(SAML:'Issuer', [], [ServiceProvider]),
                        element(SAMLP:'NameIDPolicy', ['AllowCreate'=true,
                                                       'Format'='urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified'], [])|ExtraElements]).
 
 
-http:authenticate(saml(ServiceProvider), Request, [user_id(UserId)]):-
-	( http_in_session(_),
-          http_session_data(saml('tr.com.eikon.user.name', UserId))->
+http:authenticate(saml(ServiceProvider, IdentityProvider), Request, [user_id(UserId)]):-
+        ( http_in_session(_),
+          % FIXME: hard-coded
+          http_session_data(saml('the-username', UserId))->
             true
         ; otherwise->
-            memberchk(request_uri(RelayState), Request),
-            get_xml_timestamp(Date),
-            uuid(UUID),
-            % the ID must start with a letter but the UUID may start with a number. Resolve this by prepending an 'a'
-            atom_concat(a, UUID, ID),
-            % FIXME: THis should really be a parameter to the predicate
-	    saml_idp(ServiceProvider, BaseURL),
-            XMLOptions = [header(false), layout(false)],
-            form_authn_request(Request, ID, Date, ServiceProvider, [], XML),
-            with_output_to(string(XMLString), xml_write(current_output, XML, XMLOptions)),
-            debug(saml, 'XML:~n~s~n', [XMLString]),
-            setup_call_cleanup(new_memory_file(MemFile),
-                               (setup_call_cleanup(open_memory_file(MemFile, write, MemWrite, [encoding(octet)]),
-                                                    (setup_call_cleanup(zopen(MemWrite, Write, [format(raw_deflate), level(9), close_parent(false)]),
-									format(Write, '~s', [XMLString]),
-									close(Write))
-                                                    ),
-						    close(MemWrite)),
-                                 memory_file_to_atom(MemFile, SAMLRequestRaw)
-                               ),
-                               free_memory_file(MemFile)),
-            base64(SAMLRequestRaw, SAMLRequest),
-            debug(saml, 'Encoded request: ~w~n', [SAMLRequest]),
-	    % Form the URL
-            parse_url(BaseURL, Parts),
-            % FIXME: This should be determined by metadata, I think. The signing regime is indicated in there
-	    (  saml_simple_sign(ServiceProvider, SimpleSignGoal)
-	    -> saml_certificate(ServiceProvider, _, _, PrivateKey),
-               call(SimpleSignGoal, PrivateKey, XMLString, SAMLRequest, RelayState, ExtraParameters)
-	    ;  ExtraParameters = []
-            ),
-            parse_url(IdPURL, [search(['SAMLRequest'=SAMLRequest, 'RelayState'=RelayState|ExtraParameters])|Parts]),
-            format(user_error, 'Redirecting user to~n~w~n', [IdPURL]),
-            http_redirect(moved_temporary, IdPURL, Request)
-	).
+            saml_authenticate(ServiceProvider, IdentityProvider, Request)
+        ).
+
+saml_authenticate(ServiceProvider, IdentityProvider, Request):-
+        memberchk(request_uri(RelayState), Request),
+        get_xml_timestamp(Date),
+        uuid(UUID),
+        % the ID must start with a letter but the UUID may start with a number. Resolve this by prepending an 'a'
+        atom_concat(a, UUID, ID),
+        saml_idp(ServiceProvider, IdentityProvider, _MustSign),
+        MustSign = true,
+        XMLOptions = [header(false), layout(false)],
+        % FIXME: This assumes the binding will be HTTP-Redirect, but we need to know the Destination to form the authn message
+        saml_idp_binding(ServiceProvider, IdentityProvider, 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect', BaseURL),
+        form_authn_request(Request, ID, BaseURL, Date, ServiceProvider, [], XML),
+        with_output_to(string(XMLString), xml_write(current_output, XML, XMLOptions)),
+        debug(saml, 'XML:~n~s~n', [XMLString]),
+        setup_call_cleanup(new_memory_file(MemFile),
+                           (setup_call_cleanup(open_memory_file(MemFile, write, MemWrite, [encoding(octet)]),
+                                                (setup_call_cleanup(zopen(MemWrite, Write, [format(raw_deflate), level(9), close_parent(false)]),
+	    							format(Write, '~s', [XMLString]),
+	    							close(Write))
+                                                ),
+	    				    close(MemWrite)),
+                             memory_file_to_atom(MemFile, SAMLRequestRaw)
+                           ),
+                           free_memory_file(MemFile)),
+        base64(SAMLRequestRaw, SAMLRequest),
+        debug(saml, 'Encoded request: ~w~n', [SAMLRequest]),
+        % Form the URL
+        (  saml_idp_binding(ServiceProvider, IdentityProvider, 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect', BaseURL)
+        -> parse_url(BaseURL, Parts),
+           (  MustSign == true
+           -> saml_certificate(ServiceProvider, _, _, PrivateKey),
+              saml_sign(PrivateKey, XMLString, SAMLRequest, RelayState, ExtraParameters)
+           ;  ExtraParameters = []
+           )
+        ; domain_error(supported_binding, IdentityProvider)
+        ),
+        parse_url(IdPURL, [search(['SAMLRequest'=SAMLRequest, 'RelayState'=RelayState|ExtraParameters])|Parts]),
+        format(user_error, 'Redirecting user to~n~w~n', [IdPURL]),
+        http_redirect(moved_temporary, IdPURL, Request).
 
 saml_simple_sign(PrivateKey, XMLString, _SAMLRequest, RelayState, ['SigAlg'=SigAlg,'Signature'=Signature]):-
 	SigAlg = 'http://www.w3.org/2000/09/xmldsig#rsa-sha1',
         format(string(DataToSign), 'SAMLRequest=~s&RelayState=~w&SigAlg=~w', [XMLString, RelayState, SigAlg]),
-        debug(saml, 'Data to sign:~n~s~n', [DataToSign]),
+        debug(saml, 'Data to sign with HTTP-Redirect-SimpleSign:~n~s~n', [DataToSign]),
 	sha_hash(DataToSign, Digest, [algorithm(sha1)]),
 	rsa_sign(PrivateKey, Digest, RawSignature,
 		 [ type(sha1),
@@ -135,7 +176,7 @@ saml_sign(PrivateKey, _XMLString, SAMLRequest, RelayState, ['SigAlg'=SigAlg,'Sig
         SigAlg = 'http://www.w3.org/2000/09/xmldsig#rsa-sha1',
         parse_url_search(CodesToSign, ['SAMLRequest'=SAMLRequest, 'RelayState'=RelayState, 'SigAlg'=SigAlg]),
         string_codes(DataToSign, CodesToSign),
-        debug(saml, 'Data to sign:~n~s~n', [DataToSign]),
+        debug(saml, 'Data to sign with HTTP-Redirect binding:~n~s~n', [DataToSign]),
 	sha_hash(DataToSign, Digest, [algorithm(sha1)]),
 	rsa_sign(PrivateKey, Digest, RawSignature,
 		 [ type(sha1),
@@ -159,7 +200,7 @@ saml_acs_handler(ServiceProvider, Options, Request):-
         -> xml_write(user_error, XML, [])
         ;  true
         ),
-        process_saml_response(XML, ServiceProvider, Options),
+        process_saml_response(XML, ServiceProvider, fixme, Options),
         http_redirect(moved_temporary, Relay, Request).
 
 
@@ -187,7 +228,7 @@ merge_ns([xmlns:Prefix=Value|NS], Attributes, NewAttributes, NewNS):-
 merge_ns([], A, A, NS):-
         findall(xmlns:Prefix=Value, member(xmlns:Prefix=Value, A), NS).
 
-process_saml_response(XML0, ServiceProvider, Options):-
+process_saml_response(XML0, ServiceProvider, Callback, Options):-
         SAMLP = 'urn:oasis:names:tc:SAML:2.0:protocol',
         SAML = 'urn:oasis:names:tc:SAML:2.0:assertion',
         DS = 'http://www.w3.org/2000/09/xmldsig#',
@@ -199,7 +240,7 @@ process_saml_response(XML0, ServiceProvider, Options):-
         % Response MUST contain the following attributes: ID, IssueInstant, Version
 	( memberchk(element(ns(_, SAMLP):'Status', _StatusAttributes, Status), Response)->
             % Status MUST contain a StatusCode element, and MAY contain a StatusMessage and or StatusDetail element
-	    ( memberchk(element(ns(_, SAMLP):'StatusCode', StatusCodeAttributes, _StatusCode), Status)->
+            ( memberchk(element(ns(_, SAMLP):'StatusCode', StatusCodeAttributes, _StatusCode), Status)->
                 % StatusCode MUST contain a Value attribute
                 ( memberchk('Value'=StatusCodeValue, StatusCodeAttributes)->
                     true
@@ -210,21 +251,25 @@ process_saml_response(XML0, ServiceProvider, Options):-
             )
         ; throw(illegal_saml_response)
 	),
-	(  memberchk(element(ns(_, SAML):'Issuer', _, [IssuerName]), Response)
+        (  memberchk(element(ns(_, SAML):'Issuer', _, [IssuerName]), Response)
 	-> true
 	;  IssuerName = {null}
 	),
 
         ( member(element(ns(_, DS):'Signature', _, Signature), Response)->
-            xmld_verify_signature(Signature, XML, Certificate, []),
-            certificate_is_trusted(ServiceProvider, IssuerName, Certificate)
+            xmld_verify_signature(XML, Signature, Certificate, []),
+            % Check that the certificate used to sign was one in the metadata
+            (  saml_idp_certificate(ServiceProvider, IssuerName, signing, Certificate)
+            -> true
+            ;  domain_error(trusted_certificate, Certificate)
+            )
         ; otherwise->
             % Warning: Message is not signed. Assertions may be though
             % FIXME: Determine a policy for handling this - if the SP wants them signed, we must make sure they are
             true
         ),
 
-	( StatusCodeValue == 'urn:oasis:names:tc:SAML:2.0:status:Success'->
+        ( StatusCodeValue == 'urn:oasis:names:tc:SAML:2.0:status:Success'->
             % The user has authenticated in some capacity. We can now open a session for them
             % Note that we cannot say anything ABOUT the user yet. That will come once we process the assertions
             http_open_session(_, [])
@@ -238,17 +283,21 @@ process_saml_response(XML0, ServiceProvider, Options):-
         ),
 
         % Response MAY also contain 0..N of the following elements: Assertion, EncryptedAssertion.
-        forall(member(element(ns(SAMLPrefix, SAML):'Assertion', AssertionAttributes, Assertion), Response),
-               process_assertion(ServiceProvider, XML, AssertionAttributes, Assertion)),
-        forall(member(element(ns(SAMLPrefix, SAML):'EncryptedAssertion', _, EncryptedAssertion), Response),
-               ( decrypt_xml(EncryptedAssertion, DecryptedAssertion, saml:saml_key_callback(ServiceProvider), Options),
-		 forall(member(element(SAML:'Assertion', AssertionAttributes, Assertion), DecryptedAssertion),
-                        process_assertion(ServiceProvider, XML, AssertionAttributes, Assertion))
-               )
-	      ).
+        findall(AttributeName=AttributeValue,
+                ( ( member(element(ns(SAMLPrefix, SAML):'Assertion', AssertionAttributes, Assertion), Response),
+                    process_assertion(ServiceProvider, IssuerName, XML, AssertionAttributes, Assertion, AttributeName, AttributeValue))
+                ; member(element(ns(SAMLPrefix, SAML):'EncryptedAssertion', _, EncryptedAssertion), Response),
+                  decrypt_xml(EncryptedAssertion, DecryptedAssertion, saml:saml_key_callback(ServiceProvider), Options),
+                  member(element(ns(_, SAML):'Assertion', AssertionAttributes, Assertion), DecryptedAssertion),
+                  process_assertion(ServiceProvider, IssuerName, XML, AssertionAttributes, Assertion, AttributeName, AttributeValue)
+                ),
+                AcceptedAttributes),
+        call(Callback, AcceptedAttributes).
 
-
-process_assertion(ServiceProvider, Document, Attributes, Assertion):-
+process_assertion(ServiceProvider, _EntityID, Document, Attributes, Assertion, AttributeName, AttributeValue):-
+        format(user_error, '~n~n~n', []),
+        xml_write(user_error, element('Object', Attributes, Assertion), []),
+        format(user_error, '~n~n~n', []),
         SAML = ns(_, 'urn:oasis:names:tc:SAML:2.0:assertion'),
 	DS = ns(_, 'http://www.w3.org/2000/09/xmldsig#'),
         ( memberchk('ID'=_AssertionID, Attributes)->
@@ -265,10 +314,16 @@ process_assertion(ServiceProvider, Document, Attributes, Assertion):-
         debug(saml, 'Received assertion from IdP ~w', [IssuerName]),
         ( member(element(DS:'Signature', _, Signature), Assertion)->
             xmld_verify_signature(Document, Signature, Certificate, []),
-            certificate_is_trusted(ServiceProvider, IssuerName, Certificate)
+            % Check that the certificate used to sign was one in the metadata
+            (  saml_idp_certificate(ServiceProvider, IssuerName, signing, Certificate)
+            -> true
+            ;  domain_error(trusted_certificate, Certificate)
+            )
         ; otherwise->
             % Technically the standard allows this, but it seems like practically it would be useless?
-            throw(unsigned_response)
+            % Which part of the response SHOULD be signed? The entire thing or the assertions?
+            true
+            %throw(unsigned_response)
         ),
         ( memberchk(element(SAML:'Conditions', ConditionsAttributes, Conditions), Assertion)->
             % If conditions are present, we MUST check them. These can include arbitrary, user-defined conditions
@@ -286,9 +341,9 @@ process_assertion(ServiceProvider, Document, Attributes, Assertion):-
                    condition_holds(ConditionAttributes, Condition)),
             forall(member(element(SAML:'AudienceRestriction', _AudienceRestrictionAttributes, AudienceRestriction), Conditions),
 		   ( member(element(SAML:'Audience', _, [Audience]), AudienceRestriction),
-		     saml_audience(ServiceProvider, Audience)->
+                     saml_audience(ServiceProvider, Audience)->
                        true
-                   ; throw(illegal_audience)
+                   ; true %throw(illegal_audience) % FIXME: How do you determine the 'audience' exactly?
                    )),
             ( memberchk(element(SAML:'OneTimeUse', _, _), Conditions)->
                 throw(one_time_use_not_supported)
@@ -321,15 +376,11 @@ process_assertion(ServiceProvider, Document, Attributes, Assertion):-
             )
         ; throw(not_supported(assertion_without_subject))
         ),
-        ( memberchk(element(SAML:'AttributeStatement', _, AttributeStatement), Assertion)->
-            forall(member(element(SAML:'Attribute', AttributeAttributes, Attribute), AttributeStatement),
-                   ( memberchk('Name'=Name, AttributeAttributes),
-                     memberchk(element(SAML:'AttributeValue', _, [Value]), Attribute),
-                     Key = saml(Name, Value),
-                     http_session_assert(Key)
-                   ))
-        ; true
-	).
+        !,
+        memberchk(element(SAML:'AttributeStatement', _, AttributeStatement), Assertion),
+        member(element(SAML:'Attribute', AttributeAttributes, Attribute), AttributeStatement),
+        memberchk('Name'=AttributeName, AttributeAttributes),
+        memberchk(element(SAML:'AttributeValue', _, [AttributeValue]), Attribute).
 
 process_assertion(_Attributes, _Assertion, _, _, _, _):-
 	debug(saml, 'Warning: Assertion was not valid', []).
@@ -384,12 +435,24 @@ saml_metadata(ServiceProvider, _Options, Request):-
         NameIDFormat = 'urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified',
 	ACSBinding = 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST',
 
-        memberchk(request_uri(RequestURI), Request),
-        http_absolute_location('../auth', ACSLocation, [relative_to(RequestURI)]),
+        parse_url(RequestURL, Request),
+        http_absolute_location('./auth', ACSLocation, [relative_to(RequestURL)]),
 	string_concat("-----BEGIN CERTIFICATE-----\n", X509CertificateWithoutHeader, X509Certificate),
 	string_concat(PresentableCertificate, "-----END CERTIFICATE-----\n", X509CertificateWithoutHeader),
         format(current_output, 'Content-type: text/xml~n~n', []),
-        xml_write(current_output, [element(MD:'EntityDescriptor', [entityID=ServiceProvider], [element(MD:'SPSSODescriptor', [protocolSupportEnumeration='urn:oasis:names:tc:SAML:2.0:protocol'], [element(MD:'KeyDescriptor', [use=encryption], [element(DS:'KeyInfo', [], [element(DS:'X509Data', [], [element(DS:'X509Certificate', [], [PresentableCertificate])])]),
-                                                                                                                                                                                                                                                  element(MD:'EncryptionMethod', ['Algorithm'=EncryptionMethod], [])]),
-                                                                                                                                                                                                   element(MD:'NameIDFormat', [], [NameIDFormat]),
-                                                                                                                                                                                                   element(MD:'AssertionConsumerService', [index='0', isDefault=true, 'Binding'=ACSBinding, 'Location'=ACSLocation], [])])])], []).
+        XML = [element(MD:'EntitiesDescriptor', [], [EntityDescriptor])],
+        EntityDescriptor = element(MD:'EntityDescriptor', [entityID=ServiceProvider, 'AuthnRequestsSigned'=true], [SPSSODescriptor]),
+        SPSSODescriptor = element(MD:'SPSSODescriptor', [protocolSupportEnumeration='urn:oasis:names:tc:SAML:2.0:protocol'], [EncryptionKeyDescriptor,
+                                                                                                                              SigningKeyDescriptor,
+                                                                                                                              element(MD:'NameIDFormat', [], [NameIDFormat]),
+                                                                                                                              AssertionConsumerService]),
+        EncryptionKeyDescriptor = element(MD:'KeyDescriptor', [use=encryption], [KeyInfo,
+                                                                                 element(MD:'EncryptionMethod', ['Algorithm'=EncryptionMethod], [])]),
+        SigningKeyDescriptor = element(MD:'KeyDescriptor', [use=signing], [KeyInfo,
+                                                                              element(MD:'EncryptionMethod', ['Algorithm'=EncryptionMethod], [])]),
+
+        KeyInfo = element(DS:'KeyInfo', [], [X509Data]),
+        X509Data = element(DS:'X509Data', [], [element(DS:'X509Certificate', [], [PresentableCertificate])]),
+        AssertionConsumerService = element(MD:'AssertionConsumerService', [index='0', isDefault=true, 'Binding'=ACSBinding, 'Location'=ACSLocation], []),
+        xml_write(current_output, XML, []).
+
