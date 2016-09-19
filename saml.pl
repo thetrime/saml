@@ -134,34 +134,32 @@ saml_authenticate(ServiceProvider, IdentityProvider, Callback, Request):-
         % the ID must start with a letter but the UUID may start with a number. Resolve this by prepending an 'a'
         atom_concat(a, UUID, ID),
         saml_idp(ServiceProvider, IdentityProvider, _MustSign),
+        % Always sign the request
         MustSign = true,
         XMLOptions = [header(false), layout(false)],
-        % FIXME: This assumes the binding will be HTTP-Redirect, but we need to know the Destination to form the authn message
-        saml_idp_binding(ServiceProvider, IdentityProvider, 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect', BaseURL),
-        form_authn_request(Request, ID, BaseURL, Date, ServiceProvider, [], XML),
-        with_output_to(string(XMLString), xml_write(current_output, XML, XMLOptions)),
-        debug(saml, 'XML:~n~s~n', [XMLString]),
-        setup_call_cleanup(new_memory_file(MemFile),
-                           (setup_call_cleanup(open_memory_file(MemFile, write, MemWrite, [encoding(octet)]),
-                                                (setup_call_cleanup(zopen(MemWrite, Write, [format(raw_deflate), level(9), close_parent(false)]),
-	    							format(Write, '~s', [XMLString]),
-	    							close(Write))
-                                                ),
-	    				    close(MemWrite)),
-                             memory_file_to_atom(MemFile, SAMLRequestRaw)
-                           ),
-                           free_memory_file(MemFile)),
-        base64(SAMLRequestRaw, SAMLRequest),
-        debug(saml, 'Encoded request: ~w~n', [SAMLRequest]),
-        % Form the URL
         (  saml_idp_binding(ServiceProvider, IdentityProvider, 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect', BaseURL)
         -> parse_url(BaseURL, Parts),
+           form_authn_request(Request, ID, BaseURL, Date, ServiceProvider, [], XML),
+           with_output_to(string(XMLString), xml_write(current_output, XML, XMLOptions)),
+           debug(saml, 'XML:~n~s~n', [XMLString]),
+           setup_call_cleanup(new_memory_file(MemFile),
+                              (setup_call_cleanup(open_memory_file(MemFile, write, MemWrite, [encoding(octet)]),
+                                                   (setup_call_cleanup(zopen(MemWrite, Write, [format(raw_deflate), level(9), close_parent(false)]),
+                                                                   format(Write, '~s', [XMLString]),
+                                                                   close(Write))
+                                                   ),
+                                               close(MemWrite)),
+                                memory_file_to_atom(MemFile, SAMLRequestRaw)
+                              ),
+                              free_memory_file(MemFile)),
+           base64(SAMLRequestRaw, SAMLRequest),
+           debug(saml, 'Encoded request: ~w~n', [SAMLRequest]),
            (  MustSign == true
            -> saml_sp_certificate(ServiceProvider, _, _, PrivateKey),
               saml_sign(PrivateKey, XMLString, SAMLRequest, RelayState, ExtraParameters)
            ;  ExtraParameters = []
            )
-        ; domain_error(supported_binding, IdentityProvider)
+        ; domain_error(supported_binding, IdentityProvider) % Other bindings could be implemented here, most obviously HTTP-POST and HTTP-POST-SimpleSign
         ),
         parse_url(IdPURL, [search(['SAMLRequest'=SAMLRequest, 'RelayState'=RelayState|ExtraParameters])|Parts]),
         debug(saml, 'Redirecting user to~n~w~n', [IdPURL]),
@@ -239,6 +237,8 @@ merge_ns([xmlns:Prefix=Value|NS], Attributes, NewAttributes, NewNS):-
 merge_ns([], A, A, NS):-
         findall(xmlns:Prefix=Value, member(xmlns:Prefix=Value, A), NS).
 
+
+:-meta_predicate(process_saml_response(+, +, 2, +, +)).
 process_saml_response(XML0, ServiceProvider, Callback, RequestURL, Options):-
         SAMLP = 'urn:oasis:names:tc:SAML:2.0:protocol',
         SAML = 'urn:oasis:names:tc:SAML:2.0:assertion',
